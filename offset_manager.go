@@ -24,9 +24,13 @@ type offsetManager struct {
 	conf   *Config
 	group  string
 
-	lock sync.Mutex
-	poms map[string]map[int32]*partitionOffsetManager
-	boms map[*Broker]*brokerOffsetManager
+	lock      sync.Mutex
+	poms      map[topicPartition]*partitionOffsetManager
+	boms      map[*Broker]*brokerOffsetManager
+	signal    chan offsetMgrSignal
+	batchChan chan offsetUpdate
+	timer     *time.Ticker
+	bom       *brokerOffsetManager
 }
 
 // NewOffsetManagerFromClient creates a new OffsetManager from the given client.
@@ -36,14 +40,21 @@ func NewOffsetManagerFromClient(group string, client Client) (OffsetManager, err
 	if client.Closed() {
 		return nil, ErrClosedClient
 	}
+	conf := client.Config()
 
 	om := &offsetManager{
-		client: client,
-		conf:   client.Config(),
-		group:  group,
-		poms:   make(map[string]map[int32]*partitionOffsetManager),
-		boms:   make(map[*Broker]*brokerOffsetManager),
+		client:    client,
+		conf:      conf,
+		group:     group,
+		poms:      make(map[topicPartition]*partitionOffsetManager),
+		boms:      make(map[*Broker]*brokerOffsetManager),
+		signal:    make(chan offsetMgrSignal, conf.ChannelBufferSize),
+		batchChan: make(chan offsetUpdate, conf.ChannelBufferSize),
+		timer:     time.NewTicker(conf.Consumer.Offsets.CommitInterval),
 	}
+
+	go withRecover(om.batcher)
+	go withRecover(om.hub)
 
 	return om, nil
 }
@@ -56,18 +67,10 @@ func (om *offsetManager) ManagePartition(topic string, partition int32) (Partiti
 
 	om.lock.Lock()
 	defer om.lock.Unlock()
-
-	topicManagers := om.poms[topic]
-	if topicManagers == nil {
-		topicManagers = make(map[int32]*partitionOffsetManager)
-		om.poms[topic] = topicManagers
-	}
-
-	if topicManagers[partition] != nil {
+	if om.poms[pom.topicPartition] != nil {
 		return nil, ConfigurationError("That topic/partition is already being managed")
 	}
-
-	topicManagers[partition] = pom
+	om.poms[pom.topicPartition] = pom
 	return pom, nil
 }
 
@@ -97,7 +100,6 @@ func (om *offsetManager) unrefBrokerOffsetManager(bom *brokerOffsetManager) {
 	bom.refs--
 
 	if bom.refs == 0 {
-		close(bom.updateSubscriptions)
 		if om.boms[bom.broker] == bom {
 			delete(om.boms, bom.broker)
 		}
@@ -107,18 +109,92 @@ func (om *offsetManager) unrefBrokerOffsetManager(bom *brokerOffsetManager) {
 func (om *offsetManager) abandonBroker(bom *brokerOffsetManager) {
 	om.lock.Lock()
 	defer om.lock.Unlock()
-
 	delete(om.boms, bom.broker)
+	if om.bom == bom {
+		om.bom = nil
+	}
 }
 
-func (om *offsetManager) abandonPartitionOffsetManager(pom *partitionOffsetManager) {
+func (om *offsetManager) abandonPartitionOffsetManager(pom *partitionOffsetManager) bool {
 	om.lock.Lock()
 	defer om.lock.Unlock()
-
-	delete(om.poms[pom.topic], pom.partition)
-	if len(om.poms[pom.topic]) == 0 {
-		delete(om.poms, pom.topic)
+	_, ok := om.poms[pom.topicPartition]
+	if ok {
+		delete(om.poms, pom.topicPartition)
 	}
+	return ok
+}
+
+func (om *offsetManager) markOffset(pom *partitionOffsetManager, offset int64, metadata string) {
+	om.batchChan <- offsetUpdate{pom, offset, metadata}
+}
+
+func (om *offsetManager) getBom() (*brokerOffsetManager, error) {
+	om.lock.Lock()
+	bom := om.bom
+	om.lock.Unlock()
+
+	if bom == nil {
+		var broker *Broker
+		var err error
+		if err = om.client.RefreshCoordinator(om.group); err != nil {
+			return nil, err
+		}
+
+		if broker, err = om.client.Coordinator(om.group); err != nil {
+			return nil, err
+		}
+
+		bom = om.refBrokerOffsetManager(broker)
+	}
+	return bom, nil
+}
+
+// Collect all the updates we get into batches
+func (om *offsetManager) batcher() {
+	var batch = make(offsetUpdates)
+	fire := func() {
+		if len(batch) > 0 {
+			om.signal <- offsetMgrSignal{
+				commit: batch,
+			}
+			batch = make(offsetUpdates, len(batch))
+		}
+	}
+
+	for {
+		select {
+		case update := <-om.batchChan:
+			batch[update.pom.topicPartition] = update
+		case <-om.timer.C:
+			fire()
+		}
+	}
+	fire()
+}
+
+// Dispatch batches and other events like registrations
+func (om *offsetManager) hub() {
+	var signal offsetMgrSignal
+	for {
+		select {
+		case signal = <-om.signal:
+			// do nothing, fall through
+		}
+
+		if signal.commit != nil {
+			om.flushOffsetCommit(signal.commit)
+		}
+	}
+}
+
+func (om *offsetManager) flushOffsetCommit(batch offsetUpdates) {
+	bom, err := om.getBom()
+	if err != nil {
+		// TODO
+		return
+	}
+	bom.flushToBroker(batch)
 }
 
 // Partition Offset Manager
@@ -161,92 +237,30 @@ type PartitionOffsetManager interface {
 }
 
 type partitionOffsetManager struct {
-	parent    *offsetManager
-	topic     string
-	partition int32
+	parent *offsetManager
+	topicPartition
 
 	lock     sync.Mutex
 	offset   int64
 	metadata string
-	dirty    bool
-	clean    chan none
-	broker   *brokerOffsetManager
 
-	errors    chan *ConsumerError
-	rebalance chan none
-	dying     chan none
+	errors chan *ConsumerError
 }
 
 func (om *offsetManager) newPartitionOffsetManager(topic string, partition int32) (*partitionOffsetManager, error) {
 	pom := &partitionOffsetManager{
-		parent:    om,
-		topic:     topic,
-		partition: partition,
-		clean:     make(chan none),
-		errors:    make(chan *ConsumerError, om.conf.ChannelBufferSize),
-		rebalance: make(chan none, 1),
-		dying:     make(chan none),
-	}
-
-	if err := pom.selectBroker(); err != nil {
-		return nil, err
+		parent: om,
+		topicPartition: topicPartition{
+			topic:     topic,
+			partition: partition,
+		},
+		errors: make(chan *ConsumerError, om.conf.ChannelBufferSize),
 	}
 
 	if err := pom.fetchInitialOffset(om.conf.Metadata.Retry.Max); err != nil {
 		return nil, err
 	}
-
-	pom.broker.updateSubscriptions <- pom
-
-	go withRecover(pom.mainLoop)
-
 	return pom, nil
-}
-
-func (pom *partitionOffsetManager) mainLoop() {
-	for {
-		select {
-		case <-pom.rebalance:
-			if err := pom.selectBroker(); err != nil {
-				pom.handleError(err)
-				pom.rebalance <- none{}
-			} else {
-				pom.broker.updateSubscriptions <- pom
-			}
-		case <-pom.dying:
-			if pom.broker != nil {
-				select {
-				case <-pom.rebalance:
-				case pom.broker.updateSubscriptions <- pom:
-				}
-				pom.parent.unrefBrokerOffsetManager(pom.broker)
-			}
-			pom.parent.abandonPartitionOffsetManager(pom)
-			close(pom.errors)
-			return
-		}
-	}
-}
-
-func (pom *partitionOffsetManager) selectBroker() error {
-	if pom.broker != nil {
-		pom.parent.unrefBrokerOffsetManager(pom.broker)
-		pom.broker = nil
-	}
-
-	var broker *Broker
-	var err error
-
-	if err = pom.parent.client.RefreshCoordinator(pom.parent.group); err != nil {
-		return err
-	}
-
-	if broker, err = pom.parent.client.Coordinator(pom.parent.group); err != nil {
-		return err
-	}
-
-	pom.broker = pom.parent.refBrokerOffsetManager(broker)
-	return nil
 }
 
 func (pom *partitionOffsetManager) fetchInitialOffset(retries int) error {
@@ -255,7 +269,11 @@ func (pom *partitionOffsetManager) fetchInitialOffset(retries int) error {
 	request.ConsumerGroup = pom.parent.group
 	request.AddPartition(pom.topic, pom.partition)
 
-	response, err := pom.broker.broker.FetchOffset(request)
+	bom, err := pom.parent.getBom()
+	if err != nil {
+		return err
+	}
+	response, err := bom.broker.FetchOffset(request)
 	if err != nil {
 		return err
 	}
@@ -274,7 +292,8 @@ func (pom *partitionOffsetManager) fetchInitialOffset(retries int) error {
 		if retries <= 0 {
 			return block.Err
 		}
-		if err := pom.selectBroker(); err != nil {
+		pom.parent.abandonBroker(bom)
+		if _, err := pom.parent.getBom(); err != nil {
 			return err
 		}
 		return pom.fetchInitialOffset(retries - 1)
@@ -308,28 +327,14 @@ func (pom *partitionOffsetManager) Errors() <-chan *ConsumerError {
 }
 
 func (pom *partitionOffsetManager) MarkOffset(offset int64, metadata string) {
-	pom.lock.Lock()
-	defer pom.lock.Unlock()
-
-	if offset > pom.offset {
-		pom.offset = offset
-		pom.metadata = metadata
-		pom.dirty = true
-	}
+	pom.parent.markOffset(pom, offset, metadata)
 }
 
 func (pom *partitionOffsetManager) updateCommitted(offset int64, metadata string) {
 	pom.lock.Lock()
 	defer pom.lock.Unlock()
-
-	if pom.offset == offset && pom.metadata == metadata {
-		pom.dirty = false
-
-		select {
-		case pom.clean <- none{}:
-		default:
-		}
-	}
+	pom.offset = offset
+	pom.metadata = metadata
 }
 
 func (pom *partitionOffsetManager) NextOffset() (int64, string) {
@@ -345,15 +350,9 @@ func (pom *partitionOffsetManager) NextOffset() (int64, string) {
 
 func (pom *partitionOffsetManager) AsyncClose() {
 	go func() {
-		pom.lock.Lock()
-		dirty := pom.dirty
-		pom.lock.Unlock()
-
-		if dirty {
-			<-pom.clean
+		if pom.parent.abandonPartitionOffsetManager(pom) {
+			close(pom.errors)
 		}
-
-		close(pom.dying)
 	}()
 }
 
@@ -374,55 +373,22 @@ func (pom *partitionOffsetManager) Close() error {
 // Broker Offset Manager
 
 type brokerOffsetManager struct {
-	parent              *offsetManager
-	broker              *Broker
-	timer               *time.Ticker
-	updateSubscriptions chan *partitionOffsetManager
-	subscriptions       map[*partitionOffsetManager]none
-	refs                int
+	parent *offsetManager
+	broker *Broker
+	refs   int
 }
 
 func (om *offsetManager) newBrokerOffsetManager(broker *Broker) *brokerOffsetManager {
 	bom := &brokerOffsetManager{
-		parent:              om,
-		broker:              broker,
-		timer:               time.NewTicker(om.conf.Consumer.Offsets.CommitInterval),
-		updateSubscriptions: make(chan *partitionOffsetManager),
-		subscriptions:       make(map[*partitionOffsetManager]none),
+		parent: om,
+		broker: broker,
 	}
-
-	go withRecover(bom.mainLoop)
 
 	return bom
 }
 
-func (bom *brokerOffsetManager) mainLoop() {
-	for {
-		select {
-		case <-bom.timer.C:
-			if len(bom.subscriptions) > 0 {
-				bom.flushToBroker()
-			}
-		case s, ok := <-bom.updateSubscriptions:
-			if !ok {
-				bom.timer.Stop()
-				return
-			}
-			if _, ok := bom.subscriptions[s]; ok {
-				delete(bom.subscriptions, s)
-			} else {
-				bom.subscriptions[s] = none{}
-			}
-		}
-	}
-}
-
-func (bom *brokerOffsetManager) flushToBroker() {
-	request := bom.constructRequest()
-	if request == nil {
-		return
-	}
-
+func (bom *brokerOffsetManager) flushToBroker(updates offsetUpdates) {
+	request := bom.constructRequest(updates)
 	response, err := bom.broker.CommitOffset(request)
 
 	if err != nil {
@@ -430,7 +396,8 @@ func (bom *brokerOffsetManager) flushToBroker() {
 		return
 	}
 
-	for s := range bom.subscriptions {
+	for _, update := range updates {
+		s := update.pom
 		if request.blocks[s.topic] == nil || request.blocks[s.topic][s.partition] == nil {
 			continue
 		}
@@ -440,14 +407,10 @@ func (bom *brokerOffsetManager) flushToBroker() {
 
 		if response.Errors[s.topic] == nil {
 			s.handleError(ErrIncompleteResponse)
-			delete(bom.subscriptions, s)
-			s.rebalance <- none{}
 			continue
 		}
 		if err, ok = response.Errors[s.topic][s.partition]; !ok {
 			s.handleError(ErrIncompleteResponse)
-			delete(bom.subscriptions, s)
-			s.rebalance <- none{}
 			continue
 		}
 
@@ -455,54 +418,45 @@ func (bom *brokerOffsetManager) flushToBroker() {
 		case ErrNoError:
 			block := request.blocks[s.topic][s.partition]
 			s.updateCommitted(block.offset, block.metadata)
-			break
 		case ErrUnknownTopicOrPartition, ErrNotLeaderForPartition, ErrLeaderNotAvailable:
-			delete(bom.subscriptions, s)
-			s.rebalance <- none{}
+			bom.abort(err)
+			s.handleError(err)
 		default:
 			s.handleError(err)
-			delete(bom.subscriptions, s)
-			s.rebalance <- none{}
 		}
 	}
 }
 
-func (bom *brokerOffsetManager) constructRequest() *OffsetCommitRequest {
+func (bom *brokerOffsetManager) constructRequest(updates offsetUpdates) *OffsetCommitRequest {
 	r := &OffsetCommitRequest{
 		Version:       1,
 		ConsumerGroup: bom.parent.group,
 	}
 
-	for s := range bom.subscriptions {
-		s.lock.Lock()
-		if s.dirty {
-			r.AddBlock(s.topic, s.partition, s.offset, ReceiveTime, s.metadata)
-		}
-		s.lock.Unlock()
+	for _, s := range updates {
+		r.AddBlock(s.pom.topic, s.pom.partition, s.offset, ReceiveTime, s.metadata)
 	}
-
-	if len(r.blocks) > 0 {
-		return r
-	}
-
-	return nil
+	return r
 }
 
 func (bom *brokerOffsetManager) abort(err error) {
 	_ = bom.broker.Close() // we don't care about the error this might return, we already have one
 	bom.parent.abandonBroker(bom)
-
-	for pom := range bom.subscriptions {
-		pom.handleError(err)
-		pom.rebalance <- none{}
-	}
-
-	for s := range bom.updateSubscriptions {
-		if _, ok := bom.subscriptions[s]; !ok {
-			s.handleError(err)
-			s.rebalance <- none{}
-		}
-	}
-
-	bom.subscriptions = make(map[*partitionOffsetManager]none)
 }
+
+type offsetMgrSignal struct {
+	commit offsetUpdates
+}
+
+type offsetUpdate struct {
+	pom      *partitionOffsetManager
+	offset   int64
+	metadata string
+}
+
+type topicPartition struct {
+	topic     string
+	partition int32
+}
+
+type offsetUpdates map[topicPartition]offsetUpdate
